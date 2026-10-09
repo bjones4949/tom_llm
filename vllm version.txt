@@ -1,0 +1,73 @@
+# CPU test bench: vLLM (CPU build) + AnythingLLM + OneDrive
+name: local-llm
+
+services:
+  anythingllm:
+    image: mintplexlabs/anythingllm:${ANYTHINGLLM_TAG:-latest}
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "${ANYTHINGLLM_PORT:-3001}:3001"
+    environment:
+      STORAGE_DIR: /app/server/storage
+      JWT_SECRET: ${ANYTHINGLLM_JWT_SECRET}
+      EMBEDDING_ENGINE: native
+      VECTOR_DB: lancedb
+      LLM_PROVIDER: generic-openai
+      GENERIC_OPEN_AI_BASE_PATH: http://llm:8000/v1
+      GENERIC_OPEN_AI_MODEL_PREF: local-model
+      GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: "8192"
+      GENERIC_OPEN_AI_MAX_TOKENS: "1024"
+      GENERIC_OPEN_AI_API_KEY: ${VLLM_API_KEY}
+    volumes:
+      - anythingllm-storage:/app/server/storage
+      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/app/server/storage/anythingllm-fs:ro
+    depends_on:
+      llm:
+        condition: service_healthy
+
+  onedrive:
+    image: driveone/onedrive:${ONEDRIVE_TAG:-edge}
+    restart: unless-stopped
+    environment:
+      ONEDRIVE_UID: ${PUID:-1000}
+      ONEDRIVE_GID: ${PGID:-1000}
+      ONEDRIVE_DOWNLOADONLY: ${ONEDRIVE_DOWNLOADONLY:-1}
+    volumes:
+      # configuration and data directories
+      - ./onedrive/conf:/onedrive/conf
+      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/onedrive/data
+
+  llm:
+    build: ./vllm-cpu
+    image: local/vllm-cpu:0.30.0
+    restart: unless-stopped
+    shm_size: 4g
+    environment:
+      VLLM_CPU_KVCACHE_SPACE: "2"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    command:
+      - Qwen/Qwen2.5-0.5B-Instruct
+      - --served-model-name
+      - local-model
+      - --max-model-len
+      - "8192"
+      - --api-key
+      - ${VLLM_API_KEY}
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+volumes:
+  anythingllm-storage:
+  hf-cache:

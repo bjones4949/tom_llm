@@ -1,0 +1,140 @@
+# GTX 1080 server: llama.cpp (CUDA) + AnythingLLM + OneDrive
+# vLLM does not support Pascal GPUs (compute capability 6.1), so llama.cpp is used here.
+name: local-llm
+
+services:
+  anythingllm:
+    image: mintplexlabs/anythingllm:${ANYTHINGLLM_TAG:-latest}
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "${ANYTHINGLLM_PORT:-3001}:3001"
+    environment:
+      STORAGE_DIR: /app/server/storage
+      JWT_SECRET: ${ANYTHINGLLM_JWT_SECRET}
+      VECTOR_DB: lancedb
+      # Chat model (llm service)
+      LLM_PROVIDER: generic-openai
+      GENERIC_OPEN_AI_BASE_PATH: http://llm:8000/v1
+      GENERIC_OPEN_AI_MODEL_PREF: local-model
+      GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: ${LLM_CTX:-32768}
+      GENERIC_OPEN_AI_MAX_TOKENS: "2048"     # room for KB drafts
+      GENERIC_OPEN_AI_API_KEY: ${VLLM_API_KEY}
+      # Embedding model (embed service)
+      EMBEDDING_ENGINE: generic-openai
+      EMBEDDING_BASE_PATH: http://embed:8000/v1
+      EMBEDDING_MODEL_PREF: embed-model
+      EMBEDDING_MODEL_MAX_CHUNK_LENGTH: "1000"
+      GENERIC_OPEN_AI_EMBEDDING_API_KEY: ${VLLM_API_KEY}
+    volumes:
+      - anythingllm-storage:/app/server/storage
+      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/app/server/storage/anythingllm-fs
+    depends_on:
+      llm:
+        condition: service_healthy
+      embed:
+        condition: service_healthy
+
+  onedrive:
+    image: driveone/onedrive:${ONEDRIVE_TAG:-edge}
+    restart: unless-stopped
+    environment:
+      ONEDRIVE_UID: ${PUID:-1000}
+      ONEDRIVE_GID: ${PGID:-1000}
+      ONEDRIVE_DOWNLOADONLY: ${ONEDRIVE_DOWNLOADONLY:-1}
+    volumes:
+      # configuration and data directories
+      - ./onedrive/conf:/onedrive/conf
+      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/onedrive/data
+
+  embed:
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMACPP_TAG:-server-cuda}
+    restart: unless-stopped
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - llm-models:/models
+    command:
+      - -hf
+      - ${EMBED_GGUF:-Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0}
+      - --alias
+      - embed-model
+      - --embedding
+      - --pooling
+      - last
+      - -c
+      - "8192"
+      - -b
+      - "2048"
+      - -ub
+      - "2048"
+      - -ngl
+      - "0"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMACPP_TAG:-server-cuda}
+    restart: unless-stopped
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - llm-models:/models
+    command:
+      - -hf
+      - ${LLM_GGUF:-unsloth/Qwen3.5-4B-GGUF:Q4_K_M}
+      - --alias
+      - local-model
+      - -c
+      - ${LLM_CTX:-32768}
+      - -ngl
+      - "99"
+      - --jinja
+      - --chat-template-kwargs
+      - '{"enable_thinking":false}'
+      - --temp
+      - "0.7"
+      - --top-p
+      - "0.8"
+      - --top-k
+      - "20"
+      - --min-p
+      - "0"
+      - --presence-penalty
+      - "1.5"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${VLLM_API_KEY}
+    ports:
+      - "127.0.0.1:8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+volumes:
+  anythingllm-storage:
+  llm-models:

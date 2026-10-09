@@ -1,0 +1,8 @@
+.env
+*.env
+!.env.example
+data/
+onedrive/conf/*
+!onedrive/conf/sync_list
+!onedrive/conf/config
+*.log
