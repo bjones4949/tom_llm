@@ -18,7 +18,7 @@ Commands:
   python sync.py run          loop forever (default)
   python sync.py status       print state counts
   python sync.py resync       forget the delta token, do a full re-enumeration
-  python sync.py push-prompt  apply config/workspace-prompt.txt to every case workspace
+  python sync.py push-prompt  apply config/workspace-prompt.txt (and Automatic chat mode) to every case workspace
 """
 import hashlib
 import json
@@ -263,7 +263,7 @@ class AnythingLLM:
         return self._req("GET", "/v1/auth")
 
     def create_workspace(self, name, prompt=None):
-        body = {"name": name}
+        body = {"name": name, "chatMode": "automatic"}  # tools available without typing @agent
         if prompt:
             body["openAiPrompt"] = prompt
         ws = self._req("POST", "/v1/workspace/new", json=body).get("workspace")
@@ -272,7 +272,8 @@ class AnythingLLM:
         return ws["slug"]
 
     def set_prompt(self, slug, prompt):
-        return self._req("POST", f"/v1/workspace/{slug}/update", json={"openAiPrompt": prompt})
+        return self._req("POST", f"/v1/workspace/{slug}/update",
+                         json={"openAiPrompt": prompt, "chatMode": "automatic"})
 
     def rename_workspace(self, slug, name):
         # AnythingLLM keeps the slug on rename, so the outbox route (@slug) still works
@@ -800,7 +801,7 @@ def main():
                 ok += 1
             except AllmError as e:
                 print(f"FAIL {row['slug']}: {e}")
-        print(f"Prompt pushed to {ok} of {len(rows)} case workspace(s).")
+        print(f"Prompt and Automatic chat mode applied to {ok} of {len(rows)} case workspace(s).")
         return
 
     CFG.require("tenant_id", "client_id", "sp_hostname", "sp_site_path", "allm_key")
