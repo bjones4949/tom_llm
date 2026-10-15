@@ -10,8 +10,8 @@ COPY sync.py .
 # outbox and certs folders on the host (see SETUP.md).
 ARG UID=1000
 ARG GID=1000
-RUN groupadd -g ${GID} sync && useradd -u ${UID} -g ${GID} -M -s /usr/sbin/nologin sync
-USER sync
+RUN groupadd -g ${GID} spsync && useradd -u ${UID} -g ${GID} -M -s /usr/sbin/nologin spsync
+USER spsync
 
 ENTRYPOINT ["python", "sync.py"]
 CMD ["run"]
