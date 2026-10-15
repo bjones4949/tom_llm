@@ -62,7 +62,8 @@ class Config:
         self.cases_root = [p for p in e("SP_CASES_ROOT", "Cases").split("/") if p]
         self.allm_url = e("ANYTHINGLLM_URL", "http://anythingllm:3001").rstrip("/")
         self.allm_key = e("ANYTHINGLLM_API_KEY", "")
-        self.interval = int(e("SYNC_INTERVAL", "300"))
+        self.interval = int(e("SYNC_INTERVAL", "60"))            # SharePoint delta check
+        self.outbox_interval = int(e("OUTBOX_INTERVAL", "5"))    # local outbox check
         self.skip_folders = {s.lower() for s in _list(e("SKIP_SUBFOLDERS", "Drafts"))}
         self.outbox_subfolders = _list(e("OUTBOX_SUBFOLDERS", "Drafts,Transcripts,Billing"))
         self.extensions = {x.lower() if x.startswith(".") else "." + x.lower()
@@ -705,13 +706,18 @@ def main():
         raise SystemExit(__doc__)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    log.info("Sync started, interval %ss", CFG.interval)
+    log.info("Sync started: SharePoint every %ss, outbox every %ss", CFG.interval, CFG.outbox_interval)
+    next_delta = 0.0
     while True:
         try:
-            sync.run_once()
+            if time.time() >= next_delta:
+                next_delta = time.time() + CFG.interval
+                sync.run_once()          # delta + outbox
+            else:
+                sync.process_outbox()    # cheap local check between delta passes
         except Exception:  # noqa: BLE001
             log.exception("Sync pass failed")
-        time.sleep(CFG.interval)
+        time.sleep(CFG.outbox_interval)
 
 
 if __name__ == "__main__":

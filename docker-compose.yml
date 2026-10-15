@@ -59,7 +59,8 @@ services:
       SP_CASES_ROOT: ${SP_CASES_ROOT:-Cases}
       ANYTHINGLLM_URL: http://anythingllm:3001
       ANYTHINGLLM_API_KEY: ${ANYTHINGLLM_API_KEY}
-      SYNC_INTERVAL: ${SYNC_INTERVAL:-300}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-60}
+      OUTBOX_INTERVAL: ${OUTBOX_INTERVAL:-5}
       SKIP_SUBFOLDERS: ${SKIP_SUBFOLDERS:-Drafts}
       OUTBOX_SUBFOLDERS: ${OUTBOX_SUBFOLDERS:-Drafts,Transcripts,Billing}
       ALLOWED_EXTENSIONS: ${ALLOWED_EXTENSIONS:-.pdf,.docx,.txt,.md,.csv,.xlsx,.pptx,.odt,.html,.json,.epub}
@@ -74,7 +75,7 @@ services:
     depends_on:
       - anythingllm
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/state/heartbeat') < int(os.environ.get('SYNC_INTERVAL','300'))*3+600 else 1)"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/state/heartbeat') < int(os.environ.get('SYNC_INTERVAL','60'))*3+600 else 1)"]
       interval: 5m
       timeout: 10s
       retries: 2
