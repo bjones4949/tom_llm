@@ -560,6 +560,7 @@ class Sync:
  
     # ---- main pass
     def run_once(self):
+        started = time.time()
         self.init_drive()
         items, new_link, full = self.graph.delta(self.drive_id, self.st.get("delta_link"))
         folders_changed = False
@@ -612,6 +613,14 @@ class Sync:
         # 5. write-back after delta so the folder map is current
         self.process_outbox()
         (self.cfg.state_dir / "heartbeat").write_text(str(time.time()))
+        after = self._status_counts()
+        log.info("Pass done in %.1fs: %d change(s) from SharePoint%s | embedded %d, skipped %d, errors %d",
+                 time.time() - started, len(items), " (full scan)" if full else "",
+                 after.get("embedded", 0), after.get("skipped", 0), after.get("error", 0))
+ 
+    def _status_counts(self):
+        return {r["status"]: r["c"] for r in
+                self.st.db.execute("SELECT status, count(*) c FROM files GROUP BY status")}
  
  
 # --------------------------------------------------------------------------- CLI
