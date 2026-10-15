@@ -48,6 +48,31 @@ function generatedFiles(aibitat) {
     .filter((p) => FILE_EXT.includes(path.extname(p.filename).toLowerCase()));
 }
 
+// Files made by built-in skills in earlier replies of this same chat (workspace + thread).
+// Uses AnythingLLM's own chat model; if its location changes in a future version,
+// this quietly returns nothing and only same-request files can be saved.
+async function generatedFilesFromHistory(invocation) {
+  try {
+    const { WorkspaceChats } = require(path.resolve(__dirname, "../../../../models/workspaceChats"));
+    const clause = {
+      workspaceId: Number(invocation.workspace_id),
+      thread_id: invocation.thread_id ? Number(invocation.thread_id) : null,
+      response: { contains: "storageFilename" },
+    };
+    if (invocation.user_id) clause.user_id = Number(invocation.user_id);
+    const chats = await WorkspaceChats.where(clause, 20, { id: "desc" });
+    const found = [];
+    for (const chat of chats) {
+      let outputs = [];
+      try { outputs = JSON.parse(chat.response)?.outputs || []; } catch { outputs = []; }
+      for (const o of outputs) found.push(o);
+    }
+    return generatedFiles({ _pendingOutputs: found.reverse() }); // oldest..newest
+  } catch {
+    return [];
+  }
+}
+
 function pickGenerated(list, wanted) {
   const want = path.basename(String(wanted || "")).toLowerCase();
   const exact = list.filter((p) => p.filename.toLowerCase() === want);
@@ -74,16 +99,25 @@ module.exports.runtime = {
 
       // ---- file mode: save a file the built-in Create files skill just made
       if (file) {
-        const list = generatedFiles(this.super);
-        if (!list.length) {
-          return (
-            "FAILED: no Word, Excel, PowerPoint or PDF file has been created in this request, so nothing was saved. " +
-            "Create the file with the Create files skill first, then save it, both in the same request."
-          );
-        }
-        const picked = pickGenerated(list, file);
+        // Prefer files from this request; otherwise look back through this chat.
+        const current = generatedFiles(this.super);
+        let picked = pickGenerated(current, file);
+        let earlier = [];
         if (!picked) {
-          return `FAILED: "${file}" was not created in this request. Files created: ${list.map((p) => p.filename).join(", ")}. Nothing was saved.`;
+          earlier = await generatedFilesFromHistory(this.super?.handlerProps?.invocation || {});
+          const want = path.basename(String(file)).toLowerCase();
+          const matches = earlier.filter((p) => p.filename.toLowerCase() === want);
+          picked = matches.length ? matches[matches.length - 1] : null; // newest with that name
+        }
+        if (!picked) {
+          const names = [...new Set([...current, ...earlier].map((p) => p.filename))];
+          if (!names.length) {
+            return (
+              "FAILED: no Word, Excel, PowerPoint or PDF file has been created in this chat, so nothing was saved. " +
+              "Create the file with the Create files skill first."
+            );
+          }
+          return `FAILED: "${file}" was not found. Files created in this chat: ${names.join(", ")}. Nothing was saved. Call this tool again with one of those exact names.`;
         }
         const src = path.join(GENERATED_DIR, path.basename(picked.storageFilename));
         if (!fs.existsSync(src)) {
