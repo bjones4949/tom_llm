@@ -77,6 +77,7 @@ class Config:
         self.log_names = e("LOG_NAMES", "false").lower() == "true"
         prompt_file = e("WORKSPACE_PROMPT_FILE", "")
         self.workspace_prompt = Path(prompt_file).read_text() if prompt_file and Path(prompt_file).exists() else None
+        self.deleted_prefix = e("DELETED_PREFIX", "DELETED - ")
 
     def require(self, *names):
         missing = [n for n in names if not getattr(self, n)]
@@ -273,6 +274,15 @@ class AnythingLLM:
     def set_prompt(self, slug, prompt):
         return self._req("POST", f"/v1/workspace/{slug}/update", json={"openAiPrompt": prompt})
 
+    def rename_workspace(self, slug, name):
+        # AnythingLLM keeps the slug on rename, so the outbox route (@slug) still works
+        return self._req("POST", f"/v1/workspace/{slug}/update", json={"name": name})
+
+    def list_workspaces(self):
+        """{slug: name} for every workspace in AnythingLLM."""
+        data = self._req("GET", "/v1/workspaces")
+        return {w["slug"]: w.get("name", "") for w in data.get("workspaces", []) if w.get("slug")}
+
     def upload(self, path, folder, metadata):
         with open(path, "rb") as fh:
             data = self._req(
@@ -309,6 +319,9 @@ class State:
             attempts INTEGER DEFAULT 0, updated REAL);
         CREATE TABLE IF NOT EXISTS workspaces(case_id TEXT PRIMARY KEY, slug TEXT, name TEXT);
         """)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(workspaces)")}
+        if "archived" not in cols:  # upgrade older state databases in place
+            self.db.execute("ALTER TABLE workspaces ADD COLUMN archived INTEGER DEFAULT 0")
         self.db.commit()
 
     def get(self, k):
@@ -442,6 +455,11 @@ class Sync:
                 log.warning("Workspace %s missing, recreating", slug)
                 slug = self.workspace_for(case_id, case_name, force_new=True)
                 self.allm.update_embeddings(slug, adds=locs)
+                # the rest of this case's documents were in the deleted workspace: queue them again
+                self.st.db.execute(
+                    "UPDATE files SET status='error', ctag=NULL, attempts=0, detail='workspace rebuilt' "
+                    "WHERE case_id=? AND id<>? AND status='embedded'", (case_id, fid))
+                self.st.db.commit()
             self.st.save_file(fid, ctag=ctag, case_id=case_id, locations=json.dumps(locs),
                               status="embedded", detail=None, attempts=0)
             log.info("Embedded %s into %s", n(name), slug)
@@ -629,6 +647,12 @@ class Sync:
         if new_link:
             self.st.set("delta_link", new_link)
 
+        # 4b. keep workspaces in line with case folders (rebuild / mark deleted / restore / rename)
+        try:
+            self.reconcile_workspaces()
+        except Exception as e:  # noqa: BLE001 never block the rest of the pass
+            log.error("Workspace check failed: %s", e)
+
         # 5. write-back after delta so the folder map is current
         self.process_outbox()
         (self.cfg.state_dir / "heartbeat").write_text(str(time.time()))
@@ -636,6 +660,66 @@ class Sync:
         log.info("Pass done in %.1fs: %d change(s) from SharePoint%s | embedded %d, skipped %d, errors %d",
                  time.time() - started, len(items), " (full scan)" if full else "",
                  after.get("embedded", 0), after.get("skipped", 0), after.get("error", 0))
+
+    # ---- workspace lifecycle
+    def case_is_live(self, case_id):
+        case = self.st.folder(case_id)
+        root = self.cases_root_id()
+        return case if (case is not None and root and case["parent_id"] == root) else None
+
+    def reconcile_workspaces(self):
+        """SharePoint is the source of truth for which cases exist.
+        - case folder exists, workspace deleted in AnythingLLM -> rebuild it with all documents
+        - case folder gone -> rename workspace to '<DELETED_PREFIX><name>' (chats kept)
+        - case folder back -> restore the name (documents return via the normal sync)
+        - case folder renamed -> rename the workspace to match
+        - 'DELETED -' workspace removed in AnythingLLM -> forget it
+        """
+        existing = self.allm.list_workspaces()
+        prefix = self.cfg.deleted_prefix
+        for row in self.st.db.execute("SELECT * FROM workspaces").fetchall():
+            slug, case_id = row["slug"], row["case_id"]
+            case = self.case_is_live(case_id)
+
+            if slug not in existing:
+                if case is not None:
+                    log.warning("Workspace %s was deleted in AnythingLLM but case %s still exists, rebuilding",
+                                slug, n(case["name"]))
+                    self.rebuild_case(case_id, case["name"])
+                else:
+                    self.st.db.execute("DELETE FROM workspaces WHERE case_id=?", (case_id,))
+                    self.st.db.commit()
+                    log.info("Deleted workspace %s removed in AnythingLLM, no longer tracked", slug)
+                continue
+
+            if case is not None:
+                want, archived = case["name"], 0
+            else:
+                base = row["name"] or existing[slug]
+                want, archived = (base if base.startswith(prefix) else prefix + base), 1
+
+            if existing[slug] != want:
+                self.allm.rename_workspace(slug, want)
+                log.info("Workspace %s renamed to %s", slug, n(want))
+            if row["archived"] != archived or (case is not None and row["name"] != want):
+                self.st.db.execute("UPDATE workspaces SET archived=?, name=? WHERE case_id=?",
+                                   (archived, want if case is not None else row["name"], case_id))
+                self.st.db.commit()
+
+    def rebuild_case(self, case_id, case_name):
+        self.workspace_for(case_id, case_name, force_new=True)
+        self.st.db.execute("UPDATE workspaces SET archived=0, name=? WHERE case_id=?", (case_name, case_id))
+        self.st.db.commit()
+        rows = self.st.db.execute(
+            "SELECT id FROM files WHERE case_id=? AND status IN ('embedded','error')", (case_id,)).fetchall()
+        for r in rows:
+            self.st.save_file(r["id"], ctag=None, status="pending", attempts=0)
+            item = self.graph.get_item(self.drive_id, r["id"])
+            if item is None:
+                self.handle_deleted(r["id"])
+            else:
+                self.handle_file(item)
+        log.info("Rebuilt case %s with %d document(s)", n(case_name), len(rows))
 
     def _status_counts(self):
         return {r["status"]: r["c"] for r in

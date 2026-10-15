@@ -82,6 +82,7 @@ class FakeDrive:
 class FakeAllm:
     def __init__(self):
         self.workspaces = {}   # slug -> set(locations)
+        self.names = {}        # slug -> display name
         self.docs = {}         # location -> title
         self.k = 0
 
@@ -162,7 +163,12 @@ def install(rs, drive, allm):
     def ws_new(req):
         name = json.loads(req.body)["name"]
         slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        allm.workspaces.setdefault(slug, set())
+        base, k = slug, 1
+        while slug in allm.workspaces:
+            k += 1
+            slug = f"{base}-{k}"
+        allm.workspaces[slug] = set()
+        allm.names[slug] = name
         return (200, {}, json.dumps({"workspace": {"slug": slug}}))
 
     def upload(req):
@@ -191,7 +197,22 @@ def install(rs, drive, allm):
                 s.discard(name)
         return (200, {}, json.dumps({"success": True}))
 
+    def ws_list(req):
+        return (200, {}, json.dumps({"workspaces": [{"slug": k, "name": allm.names.get(k, k)}
+                                                    for k in allm.workspaces]}))
+
+    def ws_update(req):
+        slug = req.url.split("/workspace/")[1].split("/")[0]
+        if slug not in allm.workspaces:
+            return (400, {}, "")
+        b = json.loads(req.body)
+        if "name" in b:
+            allm.names[slug] = b["name"]
+        return (200, {}, json.dumps({"workspace": {"slug": slug}}))
+
     rs.add_callback(responses.POST, f"{A}/v1/workspace/new", callback=ws_new)
+    rs.add_callback(responses.GET, f"{A}/v1/workspaces", callback=ws_list)
+    rs.add_callback(responses.POST, re.compile(rf"{A}/v1/workspace/[^/]+/update$"), callback=ws_update)
     rs.add_callback(responses.POST, re.compile(rf"{A}/v1/document/upload/.+"), callback=upload)
     rs.add_callback(responses.POST, re.compile(rf"{A}/v1/workspace/.+/update-embeddings"), callback=embed)
     rs.add_callback(responses.DELETE, f"{A}/v1/system/remove-documents", callback=remove)
@@ -279,6 +300,17 @@ def test_end_to_end():
         s.run_once()
         assert drive.child(tdir, "call-01 1.txt")
 
+        # 7b. agent skill path: @<workspace-slug> routes to that workspace's case,
+        #     even after the case folder was renamed; unknown slug is rejected
+        drop_outbox(tmp, "@case-a/Drafts/agent-note.md", b"hello")
+        drop_outbox(tmp, "@no-such-ws/Drafts/x.md", b"nope")
+        s.run_once()
+        a_drafts = drive.child(a, "Drafts")
+        assert drive.child(a_drafts, "agent-note.md")
+        assert (tmp / "outbox/.rejected/@no-such-ws/Drafts/x.md").exists()
+        s.run_once()
+        assert "agent-note.md" not in allm.ws_docs("")["case-a"]   # Drafts never embedded
+
         # 8. move whole case folder out of Cases -> its files are purged
         drive.move(a, parent=drive.root)
         s.run_once()
@@ -301,11 +333,64 @@ def test_end_to_end():
         s.run_once()
         assert "letter.pdf" not in allm.ws_docs("")["case-b"]
 
-        # 11. workspace deleted by hand in AnythingLLM -> recreated
+        # 11. workspace deleted by hand in AnythingLLM -> rebuilt with ALL its docs, no file change needed
+        before = sorted(allm.ws_docs("")["case-b"])
+        assert before, "case-b should have docs before the test"
         del allm.workspaces["case-b"]
-        drive.add(b, "new.pdf")
         s.run_once()
-        assert "new.pdf" in allm.ws_docs("")["case-b"]
+        rebuilt = [k for k in allm.workspaces if k.startswith("case-b")]
+        assert len(rebuilt) == 1, rebuilt
+        assert sorted(allm.ws_docs("")[rebuilt[0]]) == before, (allm.ws_docs(""), before)
+        assert allm.names[rebuilt[0]] == "Case B"
+
+        # 11b. deleted while a new file arrives in the same pass -> new file AND old ones end up together
+        cb = rebuilt[0]
+        del allm.workspaces[cb]
+        drive.add(b, "fresh.pdf")
+        s.run_once()
+        cb2 = [k for k in allm.workspaces if k.startswith("case-b")][0]
+        assert sorted(allm.ws_docs("")[cb2]) == sorted(before + ["fresh.pdf"]), allm.ws_docs("")
+
+        # 12. case folder renamed in SharePoint -> workspace name follows, slug unchanged
+        drive.move(b, name="Case B (Smith)")
+        s.run_once()
+        assert allm.names[cb2] == "Case B (Smith)"
+
+        # 13. case folder deleted in SharePoint -> docs removed, workspace kept and marked DELETED
+        for iid, it in list(drive.items.items()):
+            if it["parent"] == b and not it["folder"]:
+                drive.delete(iid)
+        drive.delete(b)
+        s.run_once()
+        assert allm.ws_docs("")[cb2] == []
+        assert allm.names[cb2] == "DELETED - Case B (Smith)", allm.names[cb2]
+        s.run_once()                                   # stable, no double prefix
+        assert allm.names[cb2] == "DELETED - Case B (Smith)"
+        # outbox can no longer write to a deleted case
+        drop_outbox(tmp, f"@{cb2}/Drafts/late.md", b"x")
+        s.run_once()
+        assert (tmp / f"outbox/.rejected/@{cb2}/Drafts/late.md").exists()
+
+        # 14. DELETED workspace removed in AnythingLLM -> forgotten, not recreated
+        del allm.workspaces[cb2]
+        s.run_once()
+        assert not [k for k in allm.workspaces if k.startswith("case-b")]
+        assert s.st.db.execute("SELECT count(*) FROM workspaces WHERE case_id=?", (b,)).fetchone()[0] == 0
+
+        # 15. case folder deleted then restored (recycle bin keeps IDs) -> name back, docs back
+        ca = [k for k in allm.workspaces if k.startswith("case-a")][0]
+        a_files = [iid for iid, it in drive.items.items() if it["parent"] == a and not it["folder"] and not it["deleted"]]
+        for iid in a_files:
+            drive.delete(iid)
+        drive.delete(a)
+        s.run_once()
+        assert allm.names[ca].startswith("DELETED - ")
+        drive.items[a]["deleted"] = False; drive._touch(a)
+        for iid in a_files:
+            drive.items[iid]["deleted"] = False; drive._touch(iid)
+        s.run_once()
+        assert allm.names[ca] == drive.items[a]["name"], allm.names[ca]
+        assert len(allm.ws_docs("")[ca]) == len([i for i in a_files if drive.items[i]["name"].endswith((".pdf", ".txt"))])
 
         assert (tmp / "state/heartbeat").exists()
     print("all scenarios passed")
