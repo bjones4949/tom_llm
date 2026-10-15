@@ -38,3 +38,7 @@ POST https://graph.microsoft.com/v1.0/sites/commercialitsa.sharepoint.com,7fa9cb
     { "application": { "id": "1fbc710c-6b56-4e68-8f79-7ce07407ebba", "displayName": "Spark Sync (test)" } }
   ]
 }
+
+
+set 	Require documents to be checked out before they can be edited?
+ 	 Yes   	 No to no

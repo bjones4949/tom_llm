@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SharePoint -> AnythingLLM sync service.
- 
+
 - Reads changes from one SharePoint document library using Graph delta queries.
 - Each first-level folder under SP_CASES_ROOT is a case and maps to one
   AnythingLLM workspace (created automatically).
@@ -11,7 +11,7 @@ SharePoint -> AnythingLLM sync service.
 - Files dropped into OUTBOX_DIR/<Case>/<Subfolder>/<file> are uploaded to that
   case's subfolder in SharePoint (only allowed subfolders, never overwrites).
 - The service never deletes or overwrites anything in SharePoint.
- 
+
 Commands:
   python sync.py check        test Graph + AnythingLLM connectivity
   python sync.py once         run one sync pass
@@ -32,22 +32,22 @@ import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
- 
+
 import msal
 import requests
- 
+
 log = logging.getLogger("sync")
- 
+
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024
 CHUNK = 32 * 327680  # 10 MiB, must be a multiple of 320 KiB
 MAX_RETRY_ATTEMPTS = 5
- 
- 
+
+
 def _list(value):
     return [v.strip() for v in (value or "").split(",") if v.strip()]
- 
- 
+
+
 class Config:
     def __init__(self):
         e = os.environ.get
@@ -75,37 +75,37 @@ class Config:
         self.log_names = e("LOG_NAMES", "false").lower() == "true"
         prompt_file = e("WORKSPACE_PROMPT_FILE", "")
         self.workspace_prompt = Path(prompt_file).read_text() if prompt_file and Path(prompt_file).exists() else None
- 
+
     def require(self, *names):
         missing = [n for n in names if not getattr(self, n)]
         if missing:
             raise SystemExit(f"Missing required settings: {', '.join(missing)}")
- 
- 
+
+
 CFG = None
- 
- 
+
+
 def n(name):
     """File/folder names can contain patient names. Only log them if allowed."""
     if CFG and CFG.log_names:
         return repr(name)
     return "#" + hashlib.sha1((name or "").encode()).hexdigest()[:8]
- 
- 
+
+
 # --------------------------------------------------------------------------- Graph
- 
+
 class GraphError(Exception):
     def __init__(self, resp):
         self.status = resp.status_code
         super().__init__(f"Graph {resp.request.method} {resp.status_code}: {resp.text[:300]}")
- 
- 
+
+
 class Graph:
     def __init__(self, cfg):
         self.cfg = cfg
         self.s = requests.Session()
         self._app = None
- 
+
     def _token(self):
         if self._app is None:
             cert_pem = Path(self.cfg.cert_path).read_text()
@@ -120,7 +120,7 @@ class Graph:
         if "access_token" not in result:
             raise RuntimeError(f"Token error: {result.get('error')}: {result.get('error_description')}")
         return result["access_token"]
- 
+
     def request(self, method, url, auth=True, **kw):
         if not url.startswith("http"):
             url = self.cfg.graph_base + url
@@ -138,13 +138,13 @@ class Graph:
                 continue
             return resp
         return resp
- 
+
     def json(self, method, url, ok=(200, 201), **kw):
         r = self.request(method, url, **kw)
         if r.status_code not in ok:
             raise GraphError(r)
         return r.json() if r.content else {}
- 
+
     # --- site / drive
     def resolve_drive(self):
         site = self.json("GET", f"/sites/{self.cfg.sp_hostname}:{self.cfg.sp_site_path}")
@@ -154,7 +154,7 @@ class Graph:
                 return site, d
         names = ", ".join(d.get("name", "?") for d in drives)
         raise SystemExit(f"Library '{self.cfg.sp_drive_name}' not found. Available: {names}")
- 
+
     # --- delta
     def delta(self, drive_id, delta_link):
         """Returns (items, new_delta_link, was_full_enumeration)."""
@@ -176,7 +176,7 @@ class Graph:
             url = data.get("@odata.nextLink")
             new_link = data.get("@odata.deltaLink", new_link)
         return list(items.values()), new_link, full
- 
+
     def get_item(self, drive_id, item_id):
         r = self.request("GET", f"/drives/{drive_id}/items/{item_id}")
         if r.status_code == 404:
@@ -184,7 +184,7 @@ class Graph:
         if r.status_code != 200:
             raise GraphError(r)
         return r.json()
- 
+
     def download(self, drive_id, item_id, dest):
         r = self.request("GET", f"/drives/{drive_id}/items/{item_id}/content", stream=True)
         if r.status_code != 200:
@@ -192,7 +192,7 @@ class Graph:
         with open(dest, "wb") as fh:
             for chunk in r.iter_content(1024 * 1024):
                 fh.write(chunk)
- 
+
     def ensure_child_folder(self, drive_id, parent_id, name):
         body = {"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
         r = self.request("POST", f"/drives/{drive_id}/items/{parent_id}/children", json=body)
@@ -201,7 +201,7 @@ class Graph:
         if r.status_code == 409:
             return self.json("GET", f"/drives/{drive_id}/items/{parent_id}:/{urllib.parse.quote(name)}")
         raise GraphError(r)
- 
+
     def upload(self, drive_id, parent_id, name, path):
         """Upload a file. Never overwrites: a name clash creates a renamed copy."""
         size = path.stat().st_size
@@ -234,31 +234,31 @@ class Graph:
                     raise GraphError(r)
                 start = end + 1
         return r.json()
- 
- 
+
+
 # --------------------------------------------------------------------------- AnythingLLM
- 
+
 class AllmError(Exception):
     def __init__(self, status, text):
         self.status = status
         super().__init__(f"AnythingLLM {status}: {text[:300]}")
- 
- 
+
+
 class AnythingLLM:
     def __init__(self, cfg):
         self.base = cfg.allm_url + "/api"
         self.s = requests.Session()
         self.s.headers["Authorization"] = "Bearer " + cfg.allm_key
- 
+
     def _req(self, method, path, timeout=60, **kw):
         r = self.s.request(method, self.base + path, timeout=timeout, **kw)
         if r.status_code >= 400:
             raise AllmError(r.status_code, r.text)
         return r.json() if r.content else {}
- 
+
     def check(self):
         return self._req("GET", "/v1/auth")
- 
+
     def create_workspace(self, name, prompt=None):
         body = {"name": name}
         if prompt:
@@ -267,7 +267,7 @@ class AnythingLLM:
         if not ws:
             raise AllmError(400, "workspace not created")
         return ws["slug"]
- 
+
     def upload(self, path, folder, metadata):
         with open(path, "rb") as fh:
             data = self._req(
@@ -278,18 +278,18 @@ class AnythingLLM:
         if not data.get("success"):
             raise AllmError(500, data.get("error") or "upload failed")
         return [d["location"] for d in data.get("documents", [])]
- 
+
     def update_embeddings(self, slug, adds=(), deletes=()):
         return self._req("POST", f"/v1/workspace/{slug}/update-embeddings", timeout=1800,
                          json={"adds": list(adds), "deletes": list(deletes)})
- 
+
     def remove_documents(self, locations):
         if locations:
             self._req("DELETE", "/v1/system/remove-documents", json={"names": list(locations)})
- 
- 
+
+
 # --------------------------------------------------------------------------- State
- 
+
 class State:
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,30 +305,30 @@ class State:
         CREATE TABLE IF NOT EXISTS workspaces(case_id TEXT PRIMARY KEY, slug TEXT, name TEXT);
         """)
         self.db.commit()
- 
+
     def get(self, k):
         row = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
         return row["v"] if row else None
- 
+
     def set(self, k, v):
         self.db.execute("INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)", (k, v))
         self.db.commit()
- 
+
     def folder(self, fid):
         return self.db.execute("SELECT * FROM folders WHERE id=?", (fid,)).fetchone()
- 
+
     def upsert_folder(self, fid, name, parent_id):
         self.db.execute("INSERT OR REPLACE INTO folders(id,name,parent_id) VALUES(?,?,?)",
                         (fid, name, parent_id))
- 
+
     def child_folder(self, parent_id, name):
         return self.db.execute(
             "SELECT * FROM folders WHERE parent_id=? AND lower(name)=lower(?)",
             (parent_id, name)).fetchone()
- 
+
     def file(self, fid):
         return self.db.execute("SELECT * FROM files WHERE id=?", (fid,)).fetchone()
- 
+
     def save_file(self, fid, **fields):
         fields["updated"] = time.time()
         if self.file(fid) is None:
@@ -336,15 +336,15 @@ class State:
         sets = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE files SET {sets} WHERE id=?", (*fields.values(), fid))
         self.db.commit()
- 
- 
+
+
 # --------------------------------------------------------------------------- Sync engine
- 
+
 class Sync:
     def __init__(self, cfg, graph, allm, state):
         self.cfg, self.graph, self.allm, self.st = cfg, graph, allm, state
         self.drive_id = None
- 
+
     # ---- setup
     def init_drive(self):
         drive_id = self.st.get("drive_id")
@@ -353,7 +353,7 @@ class Sync:
             drive_id = drive["id"]
             self.st.set("drive_id", drive_id)
         self.drive_id = drive_id
- 
+
     # ---- folder tree helpers
     def chain(self, folder_id):
         """[(id, name), ...] from just below the library root down to folder_id, or None if unknown."""
@@ -368,7 +368,7 @@ class Sync:
             out.append((row["id"], row["name"]))
             cur = row["parent_id"]
         return None
- 
+
     def cases_root_id(self):
         cur = self.st.get("root_id")
         for name in self.cfg.cases_root:
@@ -377,7 +377,7 @@ class Sync:
                 return None
             cur = row["id"]
         return cur
- 
+
     def classify(self, parent_id, name, size=None):
         """Returns (case_id, case_name, reason). case_id is None if the file should not be embedded."""
         ch = self.chain(parent_id)
@@ -397,7 +397,7 @@ class Sync:
         if size is not None and size > self.cfg.max_bytes:
             return None, None, "too-large"
         return case_id, case_name, "ok"
- 
+
     # ---- AnythingLLM helpers
     def workspace_for(self, case_id, case_name, force_new=False):
         row = self.st.db.execute("SELECT slug FROM workspaces WHERE case_id=?", (case_id,)).fetchone()
@@ -409,7 +409,7 @@ class Sync:
         self.st.db.commit()
         log.info("Created workspace %s for case %s", slug, n(case_name))
         return slug
- 
+
     def purge(self, fid):
         row = self.st.file(fid)
         if row is None:
@@ -419,7 +419,7 @@ class Sync:
             self.allm.remove_documents(locs)
             log.info("Removed %s from AnythingLLM (%d doc(s))", n(row["name"]), len(locs))
         self.st.save_file(fid, locations="[]")
- 
+
     def ingest(self, fid, name, case_id, case_name, ctag):
         tmp_dir = self.cfg.state_dir / "tmp" / fid
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -442,7 +442,7 @@ class Sync:
             log.info("Embedded %s into %s", n(name), slug)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
- 
+
     # ---- per-file handling
     def handle_file(self, item):
         fid, name = item["id"], item["name"]
@@ -451,17 +451,17 @@ class Sync:
         prev = self.st.file(fid)
         self.st.save_file(fid, name=name, parent_id=parent_id)
         case_id, case_name, reason = self.classify(parent_id, name, item.get("size"))
- 
+
         if case_id is None:
             if prev is not None and json.loads(prev["locations"] or "[]"):
                 self.purge(fid)
             self.st.save_file(fid, case_id=None, ctag=ctag, status="skipped", detail=reason)
             return
- 
+
         if (prev is not None and prev["status"] == "embedded" and prev["ctag"] == ctag
                 and prev["case_id"] == case_id):
             return  # metadata-only change
- 
+
         try:
             self.purge(fid)
             self.ingest(fid, name, case_id, case_name, ctag)
@@ -469,7 +469,7 @@ class Sync:
             attempts = (prev["attempts"] if prev else 0) + 1
             self.st.save_file(fid, status="error", detail=str(e)[:500], attempts=attempts, ctag=None)
             log.error("Failed %s (attempt %d): %s", n(name), attempts, e)
- 
+
     def handle_deleted(self, fid):
         if self.st.file(fid) is not None:
             self.purge(fid)
@@ -481,7 +481,7 @@ class Sync:
             self.st.db.commit()
             return "folder"
         return None
- 
+
     def recheck_all_files(self):
         """After folder renames/moves/deletes, files may have changed case without appearing in delta."""
         for row in self.st.db.execute("SELECT * FROM files").fetchall():
@@ -494,7 +494,7 @@ class Sync:
             else:
                 self.st.save_file(row["id"], ctag=None)
                 self.handle_file(item)
- 
+
     def retry_errors(self):
         rows = self.st.db.execute(
             "SELECT id FROM files WHERE status='error' AND attempts < ?", (MAX_RETRY_ATTEMPTS,)).fetchall()
@@ -504,14 +504,28 @@ class Sync:
                 self.handle_deleted(row["id"])
             else:
                 self.handle_file(item)
- 
+
     # ---- outbox (write-back)
     def _reject(self, path, rel, reason):
         dest = self.cfg.outbox_dir / ".rejected" / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), dest)
         log.warning("Outbox: %s, moved %s to .rejected", reason, n(str(rel)))
- 
+
+    def _outbox_case(self, key, cases_root):
+        """Outbox top folder is either a case folder name, or @<workspace-slug>
+        (used by the AnythingLLM agent skill, so the agent can only write to its own case)."""
+        if not cases_root:
+            return None
+        if key.startswith("@"):
+            row = self.st.db.execute("SELECT case_id FROM workspaces WHERE slug=?", (key[1:],)).fetchone()
+            if row is None:
+                return None
+            case = self.st.folder(row["case_id"])
+            # must still be a live case folder directly under the cases root
+            return case if case is not None and case["parent_id"] == cases_root else None
+        return self.st.child_folder(cases_root, key)
+
     def process_outbox(self):
         root = self.cfg.outbox_dir
         if not root.exists():
@@ -533,7 +547,7 @@ class Sync:
             if sub.lower() not in allowed:
                 self._reject(p, rel, f"subfolder {n(sub)} not allowed")
                 continue
-            case = self.st.child_folder(cases_root, case_name) if cases_root else None
+            case = self._outbox_case(case_name, cases_root)
             if case is None:
                 self._reject(p, rel, f"case folder {n(case_name)} not found in SharePoint")
                 continue
@@ -557,7 +571,7 @@ class Sync:
                 shutil.move(str(p), dest)
             else:
                 p.unlink()
- 
+
     # ---- main pass
     def run_once(self):
         started = time.time()
@@ -565,7 +579,7 @@ class Sync:
         items, new_link, full = self.graph.delta(self.drive_id, self.st.get("delta_link"))
         folders_changed = False
         seen_files, seen_folders = set(), set()
- 
+
         # 1. folders first (delta order isn't guaranteed)
         for it in items:
             if "deleted" in it:
@@ -581,18 +595,18 @@ class Sync:
                 self.st.upsert_folder(it["id"], it["name"], parent)
                 seen_folders.add(it["id"])
         self.st.db.commit()
- 
+
         # 2. deletions
         for it in items:
             if "deleted" in it and self.handle_deleted(it["id"]) == "folder":
                 folders_changed = True
- 
+
         # 3. files
         for it in items:
             if "file" in it and "deleted" not in it:
                 seen_files.add(it["id"])
                 self.handle_file(it)
- 
+
         # 4. full enumeration: anything we know about that wasn't returned is gone
         if full:
             for row in self.st.db.execute("SELECT id FROM files").fetchall():
@@ -603,13 +617,13 @@ class Sync:
                     self.st.db.execute("DELETE FROM folders WHERE id=?", (row["id"],))
                     folders_changed = True
             self.st.db.commit()
- 
+
         if folders_changed:
             self.recheck_all_files()
         self.retry_errors()
         if new_link:
             self.st.set("delta_link", new_link)
- 
+
         # 5. write-back after delta so the folder map is current
         self.process_outbox()
         (self.cfg.state_dir / "heartbeat").write_text(str(time.time()))
@@ -617,19 +631,19 @@ class Sync:
         log.info("Pass done in %.1fs: %d change(s) from SharePoint%s | embedded %d, skipped %d, errors %d",
                  time.time() - started, len(items), " (full scan)" if full else "",
                  after.get("embedded", 0), after.get("skipped", 0), after.get("error", 0))
- 
+
     def _status_counts(self):
         return {r["status"]: r["c"] for r in
                 self.st.db.execute("SELECT status, count(*) c FROM files GROUP BY status")}
- 
- 
+
+
 # --------------------------------------------------------------------------- CLI
- 
+
 def build():
     st = State(CFG.state_dir / "state.db")
     return Sync(CFG, Graph(CFG), AnythingLLM(CFG), st)
- 
- 
+
+
 def cmd_check():
     CFG.require("tenant_id", "client_id", "sp_hostname", "sp_site_path", "allm_key")
     g = Graph(CFG)
@@ -655,23 +669,23 @@ def cmd_check():
     except Exception as e:  # noqa: BLE001
         print(f"FAIL AnythingLLM API: {e}")
         sys.exit(1)
- 
- 
+
+
 def cmd_status():
     st = State(CFG.state_dir / "state.db")
     for row in st.db.execute("SELECT status, detail, count(*) c FROM files GROUP BY status, detail"):
         print(f"{row['status'] or '-':10} {row['detail'] or '':25} {row['c']}")
     ws = st.db.execute("SELECT count(*) c FROM workspaces").fetchone()["c"]
     print(f"workspaces: {ws}   delta token: {'yes' if st.get('delta_link') else 'no'}")
- 
- 
+
+
 def main():
     global CFG
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
     CFG = Config()
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
- 
+
     if cmd == "check":
         return cmd_check()
     if cmd == "status":
@@ -682,14 +696,14 @@ def main():
         st.db.commit()
         print("Delta token cleared. Next pass does a full re-enumeration.")
         return
- 
+
     CFG.require("tenant_id", "client_id", "sp_hostname", "sp_site_path", "allm_key")
     sync = build()
     if cmd == "once":
         return sync.run_once()
     if cmd != "run":
         raise SystemExit(__doc__)
- 
+
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log.info("Sync started, interval %ss", CFG.interval)
     while True:
@@ -698,7 +712,7 @@ def main():
         except Exception:  # noqa: BLE001
             log.exception("Sync pass failed")
         time.sleep(CFG.interval)
- 
- 
+
+
 if __name__ == "__main__":
     main()

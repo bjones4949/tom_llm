@@ -32,6 +32,10 @@ services:
       GENERIC_OPEN_AI_EMBEDDING_API_KEY: ${VLLM_API_KEY}
     volumes:
       - anythingllm-storage:/app/server/storage
+      # Agent skill from git. Read-only, so it's always on: set "active": false in git to disable.
+      - ./anythingllm/agent-skills/save-to-case-file:/app/server/storage/plugins/agent-skills/save-to-case-file:ro
+      # The skill writes drafts here; the sync service uploads them to SharePoint.
+      - ${OUTBOX_DIR:-/srv/llm/outbox}:/outbox
     depends_on:
       llm:
         condition: service_healthy

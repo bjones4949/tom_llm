@@ -1,0 +1,35 @@
+{
+  "active": true,
+  "hubId": "save-to-case-file",
+  "name": "Save to case file",
+  "schema": "skill-1.0.0",
+  "version": "1.0.0",
+  "description": "Saves a text or markdown draft into the Drafts folder of the case this workspace belongs to, in SharePoint. Use this whenever the user asks to save, write, add or create a document, note or draft in the case file. The user must approve each save. The file is uploaded by the sync service a few minutes later. Never tell the user a file was saved unless this tool returned a success message.",
+  "author": "Comits",
+  "license": "Proprietary",
+  "setup_args": {},
+  "examples": [
+    {
+      "prompt": "Save that summary to her file as initial-summary",
+      "call": "{\"filename\": \"initial-summary.md\", \"content\": \"# Initial summary\\n...\"}"
+    },
+    {
+      "prompt": "Add a test text doc to this case with one random word in it",
+      "call": "{\"filename\": \"test.txt\", \"content\": \"Pineapple\"}"
+    }
+  ],
+  "entrypoint": {
+    "file": "handler.js",
+    "params": {
+      "filename": {
+        "description": "File name for the draft, ending in .md or .txt. Short and descriptive, no folder paths.",
+        "type": "string"
+      },
+      "content": {
+        "description": "The full text content of the file.",
+        "type": "string"
+      }
+    }
+  },
+  "imported": true
+}
