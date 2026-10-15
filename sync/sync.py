@@ -18,6 +18,7 @@ Commands:
   python sync.py run          loop forever (default)
   python sync.py status       print state counts
   python sync.py resync       forget the delta token, do a full re-enumeration
+  python sync.py push-prompt  apply config/workspace-prompt.txt to every case workspace
 """
 import hashlib
 import json
@@ -268,6 +269,9 @@ class AnythingLLM:
         if not ws:
             raise AllmError(400, "workspace not created")
         return ws["slug"]
+
+    def set_prompt(self, slug, prompt):
+        return self._req("POST", f"/v1/workspace/{slug}/update", json={"openAiPrompt": prompt})
 
     def upload(self, path, folder, metadata):
         with open(path, "rb") as fh:
@@ -696,6 +700,23 @@ def main():
         st.db.execute("DELETE FROM kv WHERE k='delta_link'")
         st.db.commit()
         print("Delta token cleared. Next pass does a full re-enumeration.")
+        return
+
+    if cmd == "push-prompt":
+        CFG.require("allm_key")
+        if not CFG.workspace_prompt:
+            raise SystemExit("No prompt found at WORKSPACE_PROMPT_FILE, nothing pushed.")
+        st = State(CFG.state_dir / "state.db")
+        allm = AnythingLLM(CFG)
+        rows = st.db.execute("SELECT slug FROM workspaces").fetchall()
+        ok = 0
+        for row in rows:
+            try:
+                allm.set_prompt(row["slug"], CFG.workspace_prompt)
+                ok += 1
+            except AllmError as e:
+                print(f"FAIL {row['slug']}: {e}")
+        print(f"Prompt pushed to {ok} of {len(rows)} case workspace(s).")
         return
 
     CFG.require("tenant_id", "client_id", "sp_hostname", "sp_site_path", "allm_key")
