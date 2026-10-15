@@ -3,30 +3,34 @@
   "hubId": "save-to-case-file",
   "name": "Save to case file",
   "schema": "skill-1.0.0",
-  "version": "1.0.0",
-  "description": "Saves a text or markdown draft into the Drafts folder of the case this workspace belongs to, in SharePoint. Use this whenever the user asks to save, write, add or create a document, note or draft in the case file. The user must approve each save. The file is uploaded by the sync service a few minutes later. Never tell the user a file was saved unless this tool returned a success message.",
+  "version": "1.1.0",
+  "description": "Saves a draft into the Drafts folder of the case this workspace belongs to, in SharePoint. Two ways to use it: (1) for a text or markdown note, pass filename and content; (2) for a Word, Excel, PowerPoint or PDF file, FIRST create it with the Create files skill in this same request, THEN call this tool with file set to that file's name (for example report.docx) and no content. The user must approve each save. Never tell the user a file was saved unless this tool returned SUCCESS.",
   "author": "Comits",
   "license": "Proprietary",
   "setup_args": {},
   "examples": [
     {
-      "prompt": "Save that summary to her file as initial-summary",
-      "call": "{\"filename\": \"initial-summary.md\", \"content\": \"# Initial summary\\n...\"}"
-    },
-    {
       "prompt": "Add a test text doc to this case with one random word in it",
       "call": "{\"filename\": \"test.txt\", \"content\": \"Pineapple\"}"
+    },
+    {
+      "prompt": "Make a Word document summarising the case and save it to her file",
+      "call": "{\"file\": \"case-summary.docx\"}"
     }
   ],
   "entrypoint": {
     "file": "handler.js",
     "params": {
       "filename": {
-        "description": "File name for the draft, ending in .md or .txt. Short and descriptive, no folder paths.",
+        "description": "Name to save as. For text mode, end in .md or .txt. For file mode, optional (defaults to the created file's name).",
         "type": "string"
       },
       "content": {
-        "description": "The full text content of the file.",
+        "description": "Text mode only: the full text content. Leave empty when saving a created file.",
+        "type": "string"
+      },
+      "file": {
+        "description": "File mode only: the name of the .docx, .xlsx, .pptx or .pdf file that the Create files skill created earlier in this same request.",
         "type": "string"
       }
     }
