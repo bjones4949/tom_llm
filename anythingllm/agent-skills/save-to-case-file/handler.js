@@ -88,6 +88,13 @@ async function approve(ctx, description, payload) {
 module.exports.runtime = {
   handler: async function ({ filename, content, file }) {
     try {
+      // Small models often put the created file's name in `filename` and leave `file` empty.
+      // With no text content, a Word/Excel/PowerPoint/PDF name can only mean file mode.
+      const noContent = typeof content !== "string" || !content.trim();
+      if (!file && noContent && filename && FILE_EXT.includes(path.extname(String(filename)).toLowerCase())) {
+        file = filename;
+        filename = undefined;
+      }
       const ws = this.super?.handlerProps?.invocation?.workspace;
       if (!ws?.slug) {
         return "FAILED: could not tell which workspace this is, so nothing was saved. Tell the user the save did not happen.";
