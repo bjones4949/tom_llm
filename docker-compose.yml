@@ -1,18 +1,21 @@
-# GTX 1080 server: llama.cpp (CUDA) + AnythingLLM + OneDrive
+# GTX 1080 server: llama.cpp (CUDA) + AnythingLLM + SharePoint sync (Graph API)
 # vLLM does not support Pascal GPUs (compute capability 6.1), so llama.cpp is used here.
 name: local-llm
 
 services:
   anythingllm:
-    image: mintplexlabs/anythingllm:${ANYTHINGLLM_TAG:-latest}
+    image: mintplexlabs/anythingllm:${ANYTHINGLLM_TAG:-latest}   # pin a version before production
     restart: unless-stopped
     cap_add:
       - SYS_ADMIN
     ports:
-      - "${ANYTHINGLLM_PORT:-3001}:3001"
+      # Set ANYTHINGLLM_BIND to the box's Tailscale IP so it isn't exposed on the LAN.
+      # Docker-published ports bypass UFW.
+      - "${ANYTHINGLLM_BIND:-0.0.0.0}:${ANYTHINGLLM_PORT:-3001}:3001"
     environment:
       STORAGE_DIR: /app/server/storage
       JWT_SECRET: ${ANYTHINGLLM_JWT_SECRET}
+      DISABLE_TELEMETRY: "true"
       VECTOR_DB: lancedb
       # Chat model (llm service)
       LLM_PROVIDER: generic-openai
@@ -29,24 +32,49 @@ services:
       GENERIC_OPEN_AI_EMBEDDING_API_KEY: ${VLLM_API_KEY}
     volumes:
       - anythingllm-storage:/app/server/storage
-      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/app/server/storage/anythingllm-fs
     depends_on:
       llm:
         condition: service_healthy
       embed:
         condition: service_healthy
 
-  onedrive:
-    image: driveone/onedrive:${ONEDRIVE_TAG:-edge}
+  sync:
+    build:
+      context: ./sync
+      args:
+        UID: ${PUID:-1000}
+        GID: ${PGID:-1000}
     restart: unless-stopped
+    init: true
     environment:
-      ONEDRIVE_UID: ${PUID:-1000}
-      ONEDRIVE_GID: ${PGID:-1000}
-      ONEDRIVE_DOWNLOADONLY: ${ONEDRIVE_DOWNLOADONLY:-1}
+      TENANT_ID: ${SP_TENANT_ID}
+      CLIENT_ID: ${SP_CLIENT_ID}
+      SP_HOSTNAME: ${SP_HOSTNAME}
+      SP_SITE_PATH: ${SP_SITE_PATH}
+      SP_DRIVE_NAME: ${SP_DRIVE_NAME:-Documents}
+      SP_CASES_ROOT: ${SP_CASES_ROOT:-Cases}
+      ANYTHINGLLM_URL: http://anythingllm:3001
+      ANYTHINGLLM_API_KEY: ${ANYTHINGLLM_API_KEY}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-300}
+      SKIP_SUBFOLDERS: ${SKIP_SUBFOLDERS:-Drafts}
+      OUTBOX_SUBFOLDERS: ${OUTBOX_SUBFOLDERS:-Drafts,Transcripts,Billing}
+      ALLOWED_EXTENSIONS: ${ALLOWED_EXTENSIONS:-.pdf,.docx,.txt,.md,.csv,.xlsx,.pptx,.odt,.html,.json,.epub}
+      MAX_FILE_MB: ${MAX_FILE_MB:-100}
+      WORKSPACE_PROMPT_FILE: /config/workspace-prompt.txt
+      LOG_NAMES: ${SYNC_LOG_NAMES:-false}   # file names can contain patient names
     volumes:
-      # configuration and data directories
-      - ./onedrive/conf:/onedrive/conf
-      - ${ONEDRIVE_DATA_DIR:-/srv/onedrive}:/onedrive/data
+      - ${SYNC_CERTS_DIR:-./sync/certs}:/certs:ro
+      - ./sync/config:/config:ro
+      - ${SYNC_STATE_DIR:-/srv/llm/sync-state}:/state
+      - ${OUTBOX_DIR:-/srv/llm/outbox}:/outbox
+    depends_on:
+      - anythingllm
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/state/heartbeat') < int(os.environ.get('SYNC_INTERVAL','300'))*3+600 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 2
+      start_period: 15m
 
   embed:
     image: ghcr.io/ggml-org/llama.cpp:${LLAMACPP_TAG:-server-cuda}
