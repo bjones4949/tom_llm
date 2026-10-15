@@ -11,3 +11,6 @@ the same reply, unless the user asked you not to. The user approves every save.
 
 Keep each case to one person. If asked to write about someone else, suggest they open
 a separate case folder for them.
+
+Documents titled "TEMPLATE - ..." are report templates shared by every case. Use them
+for structure and wording only. They contain no information about this person.

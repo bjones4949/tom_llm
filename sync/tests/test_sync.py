@@ -83,6 +83,7 @@ class FakeAllm:
     def __init__(self):
         self.workspaces = {}   # slug -> set(locations)
         self.names = {}        # slug -> display name
+        self.pins = {}         # slug -> set(locations)
         self.docs = {}         # location -> title
         self.k = 0
 
@@ -176,6 +177,9 @@ def install(rs, drive, allm):
         body = req.body if isinstance(req.body, bytes) else req.body.read()
         m = re.search(rb'filename="([^"]+)"', body)
         title = m.group(1).decode()
+        mt = re.search(rb'"title": "([^"]+)"', body)
+        if mt and mt.group(1).startswith(b"TEMPLATE"):
+            title = mt.group(1).decode()
         allm.k += 1
         loc = f"{folder}/{title}-{allm.k}.json"
         allm.docs[loc] = title
@@ -195,7 +199,17 @@ def install(rs, drive, allm):
             allm.docs.pop(name, None)
             for s in allm.workspaces.values():
                 s.discard(name)
+            for s in allm.pins.values():
+                s.discard(name)
         return (200, {}, json.dumps({"success": True}))
+
+    def pin(req):
+        slug = req.url.split("/workspace/")[1].split("/")[0]
+        b = json.loads(req.body)
+        if slug not in allm.workspaces or b["docPath"] not in allm.workspaces[slug]:
+            return (404, {}, "")
+        (allm.pins.setdefault(slug, set()).add if b["pinStatus"] else allm.pins.setdefault(slug, set()).discard)(b["docPath"])
+        return (200, {}, json.dumps({"message": "ok"}))
 
     def ws_list(req):
         return (200, {}, json.dumps({"workspaces": [{"slug": k, "name": allm.names.get(k, k)}
@@ -216,6 +230,7 @@ def install(rs, drive, allm):
     rs.add_callback(responses.POST, re.compile(rf"{A}/v1/document/upload/.+"), callback=upload)
     rs.add_callback(responses.POST, re.compile(rf"{A}/v1/workspace/.+/update-embeddings"), callback=embed)
     rs.add_callback(responses.DELETE, f"{A}/v1/system/remove-documents", callback=remove)
+    rs.add_callback(responses.POST, re.compile(rf"{A}/v1/workspace/[^/]+/update-pin"), callback=pin)
 
 
 def make_sync(tmp):
@@ -396,5 +411,99 @@ def test_end_to_end():
     print("all scenarios passed")
 
 
+def test_templates():
+    tmp = Path(tempfile.mkdtemp())
+    drive, allm = FakeDrive(), FakeAllm()
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rs:
+        install(rs, drive, allm)
+        s = make_sync(tmp)
+        cases = drive.add(drive.root, "Cases", folder=True)
+        templates = drive.add(drive.root, "Templates", folder=True)
+        a = drive.add(cases, "Case A", folder=True)
+        drive.add(a, "notes.pdf")
+        t1 = drive.add(templates, "Initial Assessment.docx")
+        drive.add(templates, "logo.png")                       # not an allowed type
+        T1 = "TEMPLATE - Initial Assessment.docx"
+
+        def docs(slug):
+            return sorted(allm.ws_docs("").get(slug, []))
+
+        def pinned(slug):
+            return sorted(allm.docs[l] for l in allm.pins.get(slug, set()))
+
+        # 1. template goes into every case workspace, pinned; case docs unaffected
+        s.run_once()
+        assert docs("case-a") == sorted(["notes.pdf", T1]), docs("case-a")
+        assert pinned("case-a") == [T1]
+        assert not [k for k in allm.workspaces if k.startswith("templates")]   # no workspace for Templates
+        assert sum(1 for t in allm.docs.values() if t == T1) == 1             # uploaded once
+
+        # 2. new case appears -> gets the template automatically
+        b = drive.add(cases, "Case B", folder=True)
+        drive.add(b, "ref.pdf")
+        s.run_once()
+        assert docs("case-b") == sorted(["ref.pdf", T1]) and pinned("case-b") == [T1]
+
+        # 3. template edited -> replaced everywhere, still one copy, still pinned
+        drive.modify(t1, b"v2")
+        s.run_once()
+        for ws in ("case-a", "case-b"):
+            assert docs(ws).count(T1) == 1 and pinned(ws) == [T1], (ws, docs(ws), pinned(ws))
+        assert sum(1 for t in allm.docs.values() if t == T1) == 1
+
+        # 4. second template added, then a nested subfolder template
+        drive.add(templates, "Closure Report.docx")
+        sub = drive.add(templates, "SAPOL", folder=True)
+        drive.add(sub, "SAPOL Closure.docx")
+        s.run_once()
+        assert len(pinned("case-a")) == 3, pinned("case-a")
+
+        # 5. workspace deleted in AnythingLLM -> rebuilt with case docs AND templates
+        del allm.workspaces["case-a"]
+        s.run_once()
+        ca = [k for k in allm.workspaces if k.startswith("case-a")][0]
+        assert "notes.pdf" in docs(ca) and len(pinned(ca)) == 3, (docs(ca), pinned(ca))
+
+        # 6. template deleted -> gone from every workspace
+        drive.delete(t1)
+        s.run_once()
+        assert T1 not in docs(ca) and T1 not in docs("case-b")
+
+        # 7. a reviewed draft moved from a case into Templates becomes a template
+        draft = drive.add(b, "Progress Note.docx")
+        s.run_once()
+        assert "Progress Note.docx" in docs("case-b")
+        drive.move(draft, parent=templates)
+        s.run_once()
+        TP = "TEMPLATE - Progress Note.docx"
+        assert "Progress Note.docx" not in docs("case-b")
+        assert TP in pinned("case-b") and TP in pinned(ca)
+
+        # 8. template moved out of Templates into a case -> no longer a template anywhere
+        drive.move(draft, parent=b)
+        s.run_once()
+        assert TP not in docs(ca) and TP not in docs("case-b")
+        assert "Progress Note.docx" in docs("case-b") and "Progress Note.docx" not in docs(ca)
+
+        # 9. deleted case workspace (archived) doesn't get new templates
+        for iid, it in list(drive.items.items()):
+            if it["parent"] == b and not it["folder"]:
+                drive.delete(iid)
+        drive.delete(b)
+        s.run_once()
+        drive.add(templates, "Home Visit.docx")
+        s.run_once()
+        assert "TEMPLATE - Home Visit.docx" in docs(ca)
+        assert "TEMPLATE - Home Visit.docx" not in docs("case-b")
+
+        # 10. restart (fresh Sync object, same state) -> nothing re-uploaded
+        uploads = allm.k
+        s2 = make_sync(tmp)
+        s2.run_once()
+        assert allm.k == uploads
+    print("template scenarios passed")
+
+
 if __name__ == "__main__":
     test_end_to_end()
+    test_templates()

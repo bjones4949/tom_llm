@@ -61,6 +61,9 @@ class Config:
         self.sp_site_path = e("SP_SITE_PATH", "")          # /sites/CaseFiles
         self.sp_drive_name = e("SP_DRIVE_NAME", "Documents")
         self.cases_root = [p for p in e("SP_CASES_ROOT", "Cases").split("/") if p]
+        # Shared report templates: added (and pinned) to every live case workspace
+        self.templates_root = [p for p in e("SP_TEMPLATES_ROOT", "Templates").split("/") if p]
+        self.pin_templates = e("PIN_TEMPLATES", "true").lower() == "true"
         self.allm_url = e("ANYTHINGLLM_URL", "http://anythingllm:3001").rstrip("/")
         self.allm_key = e("ANYTHINGLLM_API_KEY", "")
         self.interval = int(e("SYNC_INTERVAL", "60"))            # SharePoint delta check
@@ -303,6 +306,10 @@ class AnythingLLM:
         if locations:
             self._req("DELETE", "/v1/system/remove-documents", json={"names": list(locations)})
 
+    def update_pin(self, slug, location, pinned=True):
+        return self._req("POST", f"/v1/workspace/{slug}/update-pin",
+                         json={"docPath": location, "pinStatus": bool(pinned)})
+
 
 # --------------------------------------------------------------------------- State
 
@@ -319,6 +326,7 @@ class State:
             locations TEXT DEFAULT '[]', status TEXT, detail TEXT,
             attempts INTEGER DEFAULT 0, updated REAL);
         CREATE TABLE IF NOT EXISTS workspaces(case_id TEXT PRIMARY KEY, slug TEXT, name TEXT);
+        CREATE TABLE IF NOT EXISTS template_links(file_id TEXT, slug TEXT, PRIMARY KEY(file_id, slug));
         """)
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(workspaces)")}
         if "archived" not in cols:  # upgrade older state databases in place
@@ -397,6 +405,20 @@ class Sync:
             cur = row["id"]
         return cur
 
+    def template_reason(self, parent_id, name, size=None):
+        """None if the file isn't under the Templates folder, else 'ok' or why it's skipped."""
+        pre = self.cfg.templates_root
+        if not pre:
+            return None
+        ch = self.chain(parent_id)
+        if ch is None or [c[1].lower() for c in ch[:len(pre)]] != [p.lower() for p in pre]:
+            return None
+        if Path(name).suffix.lower() not in self.cfg.extensions:
+            return "extension-not-allowed"
+        if size is not None and size > self.cfg.max_bytes:
+            return "too-large"
+        return "ok"
+
     def classify(self, parent_id, name, size=None):
         """Returns (case_id, case_name, reason). case_id is None if the file should not be embedded."""
         ch = self.chain(parent_id)
@@ -474,6 +496,13 @@ class Sync:
         ctag = item.get("cTag")
         prev = self.st.file(fid)
         self.st.save_file(fid, name=name, parent_id=parent_id)
+
+        treason = self.template_reason(parent_id, name, item.get("size"))
+        if treason is not None:
+            return self.handle_template(fid, name, ctag, prev, treason)
+        if prev is not None and prev["status"] == "template":
+            self.unlink_template(fid)  # moved out of Templates
+
         case_id, case_name, reason = self.classify(parent_id, name, item.get("size"))
 
         if case_id is None:
@@ -497,6 +526,7 @@ class Sync:
     def handle_deleted(self, fid):
         if self.st.file(fid) is not None:
             self.purge(fid)
+            self.st.db.execute("DELETE FROM template_links WHERE file_id=?", (fid,))
             self.st.db.execute("DELETE FROM files WHERE id=?", (fid,))
             self.st.db.commit()
             return "file"
@@ -509,9 +539,14 @@ class Sync:
     def recheck_all_files(self):
         """After folder renames/moves/deletes, files may have changed case without appearing in delta."""
         for row in self.st.db.execute("SELECT * FROM files").fetchall():
-            case_id, _, reason = self.classify(row["parent_id"], row["name"])
-            if case_id == row["case_id"] and (case_id is not None or row["status"] == "skipped"):
-                continue
+            in_templates = self.template_reason(row["parent_id"], row["name"]) == "ok"
+            if in_templates or row["status"] == "template":
+                if in_templates and row["status"] == "template":
+                    continue
+            else:
+                case_id, _, reason = self.classify(row["parent_id"], row["name"])
+                if case_id == row["case_id"] and (case_id is not None or row["status"] == "skipped"):
+                    continue
             item = self.graph.get_item(self.drive_id, row["id"])
             if item is None:
                 self.handle_deleted(row["id"])
@@ -528,6 +563,66 @@ class Sync:
                 self.handle_deleted(row["id"])
             else:
                 self.handle_file(item)
+
+    # ---- shared templates
+    def unlink_template(self, fid):
+        self.purge(fid)  # removes it from every workspace it was in
+        self.st.db.execute("DELETE FROM template_links WHERE file_id=?", (fid,))
+        self.st.db.commit()
+
+    def handle_template(self, fid, name, ctag, prev, reason):
+        if reason != "ok":
+            if prev is not None and json.loads(prev["locations"] or "[]"):
+                self.unlink_template(fid)
+            self.st.save_file(fid, case_id=None, ctag=ctag, status="skipped", detail=f"template-{reason}")
+            return
+        if prev is not None and prev["status"] == "template" and prev["ctag"] == ctag:
+            return  # metadata-only change
+        tmp_dir = self.cfg.state_dir / "tmp" / fid
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.unlink_template(fid)  # old version (or old case copy) out everywhere
+            path = tmp_dir / name
+            self.graph.download(self.drive_id, fid, path)
+            meta = {"title": f"TEMPLATE - {name}",
+                    "docSource": "Report template shared by all cases. Not information about this person."}
+            locs = self.allm.upload(path, "templates", meta)
+            self.st.save_file(fid, case_id=None, ctag=ctag, locations=json.dumps(locs),
+                              status="template", detail=None, attempts=0)
+            log.info("Template %s uploaded, adding to all case workspaces", n(name))
+        except Exception as e:  # noqa: BLE001
+            attempts = (prev["attempts"] if prev else 0) + 1
+            self.st.save_file(fid, status="error", detail=str(e)[:500], attempts=attempts, ctag=None)
+            log.error("Template %s failed (attempt %d): %s", n(name), attempts, e)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        self.sync_templates()
+
+    def sync_templates(self):
+        """Make sure every live case workspace has every template, pinned."""
+        live = [r["slug"] for r in self.st.db.execute("SELECT slug FROM workspaces WHERE archived=0")]
+        self.st.db.execute(
+            "DELETE FROM template_links WHERE slug NOT IN (SELECT slug FROM workspaces)")
+        templates = self.st.db.execute("SELECT id, name, locations FROM files WHERE status='template'").fetchall()
+        for t in templates:
+            locs = json.loads(t["locations"] or "[]")
+            if not locs:
+                continue
+            for slug in live:
+                if self.st.db.execute("SELECT 1 FROM template_links WHERE file_id=? AND slug=?",
+                                      (t["id"], slug)).fetchone():
+                    continue
+                try:
+                    self.allm.update_embeddings(slug, adds=locs)
+                    if self.cfg.pin_templates:
+                        for loc in locs:
+                            self.allm.update_pin(slug, loc, True)
+                except AllmError as e:
+                    log.warning("Could not add template %s to %s: %s", n(t["name"]), slug, e)
+                    continue  # workspace missing: reconcile rebuilds it, then we retry
+                self.st.db.execute("INSERT OR IGNORE INTO template_links(file_id, slug) VALUES(?,?)",
+                                   (t["id"], slug))
+        self.st.db.commit()
 
     # ---- outbox (write-back)
     def _reject(self, path, rel, reason):
@@ -653,6 +748,10 @@ class Sync:
             self.reconcile_workspaces()
         except Exception as e:  # noqa: BLE001 never block the rest of the pass
             log.error("Workspace check failed: %s", e)
+        try:
+            self.sync_templates()
+        except Exception as e:  # noqa: BLE001
+            log.error("Template check failed: %s", e)
 
         # 5. write-back after delta so the folder map is current
         self.process_outbox()
